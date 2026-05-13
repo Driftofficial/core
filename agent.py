@@ -566,9 +566,10 @@ def send_slack_alert(
     persona_score: float,
     recency_score: float,
 ) -> None:
-    webhook = os.getenv("SLACK_WEBHOOK_URL", "")
-    if not webhook:
-        log.warning("SLACK_WEBHOOK_URL not set — Slack alert skipped")
+    bot_token = os.getenv("SLACK_BOT_TOKEN", "")
+    user_id = os.getenv("SLACK_USER_ID", "")
+    if not bot_token or not user_id:
+        log.warning("SLACK_BOT_TOKEN or SLACK_USER_ID not set — Slack alert skipped")
         return
 
     age_days = (NOW - post["posted_at_unix"]) / 86400
@@ -613,11 +614,20 @@ def send_slack_alert(
     )
 
     try:
-        resp = requests.post(webhook, json={"text": message}, timeout=10)
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {bot_token}"},
+            json={"channel": user_id, "text": message},
+            timeout=10,
+        )
         resp.raise_for_status()
-        log.info(f"Slack alert sent: {post['id']}")
+        payload = resp.json()
+        if not payload.get("ok"):
+            log.error(f"Slack API error for {post['id']}: {payload.get('error')}")
+        else:
+            log.info(f"Slack DM sent: {post['id']}")
     except Exception as exc:
-        log.error(f"Slack alert failed for {post['id']}: {exc}")
+        log.error(f"Slack DM failed for {post['id']}: {exc}")
 
 
 # ---------------------------------------------------------------------------
