@@ -287,6 +287,21 @@ def _reddit_url_from_permalink(permalink: str) -> Optional[str]:
     return f"https://www.reddit.com{permalink}"
 
 
+def _reddit_thread_url_from_comment_permalink(permalink: str) -> Optional[str]:
+    """
+    Strip the comment ID segment from a comment permalink to get the parent thread URL.
+    e.g. /r/devops/comments/abc123/title/xyz789/ → https://www.reddit.com/r/devops/comments/abc123/title/
+    """
+    if not _REDDIT_PERMALINK_RE.match(permalink):
+        return None
+    # Split into parts: ['', 'r', 'sub', 'comments', 'post_id', 'title', 'comment_id', '']
+    parts = permalink.rstrip("/").split("/")
+    if len(parts) >= 7:
+        thread_path = "/".join(parts[:6]) + "/"
+        return f"https://www.reddit.com{thread_path}"
+    return f"https://www.reddit.com{permalink}"
+
+
 def _hn_item_url(object_id: str) -> Optional[str]:
     if not re.match(r"^\d{1,15}$", str(object_id)):
         log.warning(f"Non-numeric HN objectID: {object_id!r}")
@@ -484,6 +499,7 @@ class RedditClient:
             "content_type": "comment",
             "subreddit": subreddit,
             "url": url,
+            "thread_url": _reddit_thread_url_from_comment_permalink(permalink),
             "username": f"u/{author}",
             "posted_at_unix": created,
             "posted_at": datetime.fromtimestamp(created, tz=timezone.utc).isoformat(),
@@ -700,6 +716,10 @@ def send_telegram_alert(
         f"<b>Enrichment:</b> Search LinkedIn &amp; Google for company, name, or role\n\n"
         f'<a href="{post["url"]}">View Post →</a>'
     )
+
+    # For comments, add a second link to the full thread so all replies are visible
+    if post.get("content_type") == "comment" and post.get("thread_url"):
+        message += f'\n<a href="{post["thread_url"]}">View Full Thread →</a>'
 
     try:
         resp = requests.post(
