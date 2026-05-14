@@ -1,14 +1,16 @@
 """
 Social listening agent for Larridin AI.
 
-Monitors Reddit (posts + comments, 9 subreddits via OAuth) and Hacker News
+Monitors Reddit (public JSON API — no credentials required) and Hacker News
 (Algolia API) for engineering leaders expressing pain points that Larridin
 directly solves: AI sprawl, shadow AI, ROI, governance, license waste,
 proficiency gaps, security risk, standardization, and procurement challenges.
 
+Alerts are delivered as Telegram DMs.
+
 Usage:
     python agent.py                    # full run
-    python agent.py --dry-run          # score & log without sending to Slack
+    python agent.py --dry-run          # score & log without sending messages
     python agent.py --source reddit    # Reddit only
     python agent.py --source hn        # Hacker News only
 
@@ -16,8 +18,7 @@ Scheduled runs (every 6 hours via cron):
     0 */6 * * * cd /path/to/project && python agent.py >> agent.log 2>&1
 
 Required environment variables (see .env.example):
-    REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD
-    SLACK_BOT_TOKEN, SLACK_USER_ID
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 """
 
 import argparse
@@ -57,7 +58,6 @@ DRY_RUN: bool = False
 SEEN_POSTS_FILE = Path("seen_posts.json")
 LEADS_LOG_FILE = Path("leads_log.jsonl")
 
-# Ingest cap — prevents pathological API responses from exhausting memory
 MAX_TEXT_LEN = 10_000
 
 HIGH_THRESHOLD = 7.0
@@ -67,7 +67,7 @@ NOW = int(time.time())
 FOURTEEN_DAYS_SECS = 14 * 24 * 3600
 
 # ---------------------------------------------------------------------------
-# Accounts to skip at ingest (bots, deleted users, auto-moderation)
+# Accounts to skip at ingest
 # ---------------------------------------------------------------------------
 BLOCKED_AUTHORS: set[str] = {
     "AutoModerator", "automoderator", "[deleted]", "[removed]",
@@ -95,7 +95,6 @@ IC_SUBREDDITS: set[str] = {"cscareerquestions"}
 
 # ---------------------------------------------------------------------------
 # Search queries — one OR-joined query per cluster
-# (9 subreddits × 5 clusters × 2 types (post+comment) = 90 Reddit API calls)
 # ---------------------------------------------------------------------------
 SEARCH_CLUSTERS: dict[str, str] = {
     "sprawl_visibility": (
@@ -122,7 +121,6 @@ SEARCH_CLUSTERS: dict[str, str] = {
     ),
 }
 
-# Individual keywords for HN Algolia (handles focused terms better than OR chains)
 HN_KEYWORDS: list[str] = [
     "AI tool sprawl",
     "shadow AI",
@@ -271,45 +269,11 @@ AI_TOOL_NAMES: list[str] = [
 # Security helpers
 # ---------------------------------------------------------------------------
 
-# Private/reserved IP ranges that must never appear in outbound URLs
 _PRIVATE_IP_RE = re.compile(
     r"^(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|"
     r"172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)$",
     re.IGNORECASE,
 )
-
-
-def _safe_url(url: str, allowed_hosts: Optional[set[str]] = None) -> Optional[str]:
-    """
-    Validate that a URL is safe to embed in a Slack message or log.
-
-    Returns the URL unchanged if it passes, or None if it should be rejected.
-    Rejects: non-https schemes, private/localhost hosts, and (optionally)
-    hosts not in allowed_hosts.
-    """
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return None
-
-    if parsed.scheme != "https":
-        log.debug(f"Rejected non-https URL: scheme={parsed.scheme!r}")
-        return None
-
-    host = parsed.hostname or ""
-    if not host:
-        return None
-
-    if _PRIVATE_IP_RE.match(host):
-        log.warning(f"Rejected private-host URL: {host!r}")
-        return None
-
-    if allowed_hosts and host not in allowed_hosts:
-        log.debug(f"URL host {host!r} not in allowlist — rejected")
-        return None
-
-    return url
-
 
 _REDDIT_PERMALINK_RE = re.compile(
     r"^/r/[A-Za-z0-9_]{1,50}/comments/[A-Za-z0-9_]+/"
@@ -317,7 +281,6 @@ _REDDIT_PERMALINK_RE = re.compile(
 
 
 def _reddit_url_from_permalink(permalink: str) -> Optional[str]:
-    """Convert a Reddit API permalink to a safe absolute URL."""
     if not _REDDIT_PERMALINK_RE.match(permalink):
         log.warning(f"Unexpected Reddit permalink shape: {permalink!r}")
         return None
@@ -325,20 +288,18 @@ def _reddit_url_from_permalink(permalink: str) -> Optional[str]:
 
 
 def _hn_item_url(object_id: str) -> Optional[str]:
-    """Return a safe HN item URL from a numeric object ID."""
     if not re.match(r"^\d{1,15}$", str(object_id)):
         log.warning(f"Non-numeric HN objectID: {object_id!r}")
         return None
     return f"https://news.ycombinator.com/item?id={object_id}"
 
 
-def _slack_escape(text: str) -> str:
-    """Escape Slack mrkdwn special characters in externally sourced text."""
+def _html_escape(text: str) -> str:
+    """Escape HTML special characters in externally sourced text (for Telegram HTML mode)."""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _truncate(text: str, max_len: int = MAX_TEXT_LEN) -> str:
-    """Hard-cap text at max_len characters to prevent memory abuse."""
     return text[:max_len] if len(text) > max_len else text
 
 
@@ -377,7 +338,7 @@ def score_pain_specificity(text: str, categories: list[str]) -> float:
         return 1.0
 
     text_lower = text.lower()
-    score = 2.0 + min(len(categories), 3) * 1.5  # 3.5 – 6.5 base
+    score = 2.0 + min(len(categories), 3) * 1.5
 
     if any(u in text_lower for u in URGENCY_SIGNALS):
         score += 0.75
@@ -400,7 +361,7 @@ def score_persona_match(text: str, subreddit: Optional[str]) -> float:
         base = 5.5
     elif subreddit in IC_SUBREDDITS:
         base = 2.5
-    elif subreddit is None:  # Hacker News
+    elif subreddit is None:
         base = 5.0
     else:
         base = 4.5
@@ -438,57 +399,16 @@ def compute_final_score(pain: float, persona: float, recency: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Reddit client
+# Reddit client — public JSON API, no credentials required
 # ---------------------------------------------------------------------------
 
 class RedditClient:
-    AUTH_URL = "https://www.reddit.com/api/v1/access_token"
-    API_BASE = "https://oauth.reddit.com"
-
-    def __init__(self) -> None:
-        self.client_id = os.getenv("REDDIT_CLIENT_ID", "")
-        self.client_secret = os.getenv("REDDIT_CLIENT_SECRET", "")
-        self.username = os.getenv("REDDIT_USERNAME", "")
-        self.password = os.getenv("REDDIT_PASSWORD", "")
-        self.session = requests.Session()
-        self.session.headers["User-Agent"] = "Larridin-SocialListening/1.0"
-        self._authenticated = False
-
-    def _authenticate(self) -> bool:
-        if not all([self.client_id, self.client_secret, self.username, self.password]):
-            log.warning("Reddit credentials not fully set — skipping Reddit")
-            return False
-        try:
-            resp = self.session.post(
-                self.AUTH_URL,
-                auth=(self.client_id, self.client_secret),
-                data={
-                    "grant_type": "password",
-                    "username": self.username,
-                    "password": self.password,
-                },
-                timeout=15,
-            )
-            resp.raise_for_status()
-            token = resp.json()["access_token"]
-            self.session.headers["Authorization"] = f"Bearer {token}"
-            self._authenticated = True
-            log.info("Reddit OAuth authenticated")
-            return True
-        except requests.HTTPError as exc:
-            # Log the status code only — never log response body which may echo credentials
-            log.error(f"Reddit authentication failed: HTTP {exc.response.status_code}")
-            return False
-        except Exception:
-            log.error("Reddit authentication failed: network or parse error")
-            return False
+    BASE = "https://www.reddit.com"
+    # Reddit requires a descriptive User-Agent for public API access
+    HEADERS = {"User-Agent": "Larridin-SocialListening/1.0 (social listening agent)"}
 
     def _search(self, subreddit: str, query: str, content_type: str) -> list[dict]:
-        """
-        Search a subreddit for posts or comments matching query.
-        content_type: "link" for posts, "comment" for comments.
-        """
-        url = f"{self.API_BASE}/r/{subreddit}/search"
+        url = f"{self.BASE}/r/{subreddit}/search.json"
         params = {
             "q": query,
             "sort": "new",
@@ -498,7 +418,7 @@ class RedditClient:
             "type": content_type,
         }
         try:
-            resp = self.session.get(url, params=params, timeout=15)
+            resp = requests.get(url, params=params, headers=self.HEADERS, timeout=15)
             resp.raise_for_status()
             return resp.json().get("data", {}).get("children", [])
         except Exception as exc:
@@ -506,11 +426,9 @@ class RedditClient:
             return []
 
     def _parse_post(self, data: dict, subreddit: str, cutoff: int) -> Optional[dict]:
-        """Parse a Reddit post (link) into a normalised record, or None to skip."""
         author = data.get("author", "")
         if author in BLOCKED_AUTHORS:
             return None
-
         try:
             created = int(data.get("created_utc", 0))
         except (TypeError, ValueError):
@@ -541,11 +459,9 @@ class RedditClient:
         }
 
     def _parse_comment(self, data: dict, subreddit: str, cutoff: int) -> Optional[dict]:
-        """Parse a Reddit comment into a normalised record, or None to skip."""
         author = data.get("author", "")
         if author in BLOCKED_AUTHORS:
             return None
-
         try:
             created = int(data.get("created_utc", 0))
         except (TypeError, ValueError):
@@ -576,9 +492,6 @@ class RedditClient:
         }
 
     def fetch_posts(self, seen: set[str]) -> list[dict]:
-        if not self._authenticate():
-            return []
-
         cutoff = NOW - FOURTEEN_DAYS_SECS
         results: list[dict] = []
         run_ids: set[str] = set()
@@ -604,7 +517,8 @@ class RedditClient:
                         run_ids.add(raw_id)
                         results.append(record)
 
-                    time.sleep(1.1)  # Reddit rate limit: ~1 req/sec for OAuth apps
+                    # Public API: 1 req/2 sec to stay well within rate limits
+                    time.sleep(2.0)
 
         log.info(f"Reddit: fetched {len(results)} candidate posts/comments")
         return results
@@ -613,9 +527,6 @@ class RedditClient:
 # ---------------------------------------------------------------------------
 # Hacker News client (Algolia search API)
 # ---------------------------------------------------------------------------
-
-_HN_ALLOWED_HOST = "news.ycombinator.com"
-
 
 class HNClient:
     SEARCH_URL = "https://hn.algolia.com/api/v1/search"
@@ -653,8 +564,6 @@ class HNClient:
                     if created < cutoff:
                         continue
 
-                    # Always use the canonical HN item URL — never trust story URLs
-                    # from user-submitted content as the primary link
                     url = _hn_item_url(object_id)
                     if not url:
                         continue
@@ -693,7 +602,7 @@ class HNClient:
 
 
 # ---------------------------------------------------------------------------
-# Persona assessment (shared between Slack and log)
+# Persona assessment
 # ---------------------------------------------------------------------------
 
 def _build_persona_assessment(text: str, subreddit: Optional[str]) -> str:
@@ -705,7 +614,7 @@ def _build_persona_assessment(text: str, subreddit: Optional[str]) -> str:
             end = min(len(text), m.end() + 30)
             snippet = text[start:end].strip().replace("\n", " ")
             return (
-                f"Post contains leadership signal: '...{snippet}...'. "
+                f"Leadership signal detected: '...{snippet}...'. "
                 "Likely an engineering leader or technical decision-maker."
             )
     if subreddit in LEADERSHIP_SUBREDDITS:
@@ -716,23 +625,33 @@ def _build_persona_assessment(text: str, subreddit: Optional[str]) -> str:
     if subreddit in DEVOPS_SUBREDDITS:
         return (
             f"Posted in r/{subreddit}. May be a DevOps/platform lead or IC. "
-            "Manual enrichment recommended to confirm seniority."
+            "Manual enrichment recommended."
         )
-    return "Role and seniority unclear from post text. Manual enrichment strongly recommended."
+    return "Role unclear from post text. Manual enrichment strongly recommended."
 
 
 # ---------------------------------------------------------------------------
-# Slack alerting (Block Kit)
+# Telegram alerting
 # ---------------------------------------------------------------------------
 
-def _build_slack_blocks(
+def send_telegram_alert(
     post: dict,
     categories: list[str],
     score: float,
     pain_score: float,
     persona_score: float,
     recency_score: float,
-) -> list[dict]:
+) -> None:
+    if DRY_RUN:
+        log.info(f"[DRY RUN] Would send Telegram message for {post['id']} (score={score})")
+        return
+
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not bot_token or not chat_id:
+        log.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — alert skipped")
+        return
+
     age_days = (NOW - post["posted_at_unix"]) / 86400
     if age_days < 1:
         age_str = "today"
@@ -750,122 +669,52 @@ def _build_slack_blocks(
         PAIN_CATEGORIES[c]["label"] for c in categories if c in PAIN_CATEGORIES
     ) or "General AI Pain Point"
 
-    # Escape external content before inserting into Slack mrkdwn
-    summary_raw = post["text"][:600].replace("\n", " ").strip()
-    if len(post["text"]) > 600:
+    # Escape external content before inserting into HTML
+    summary_raw = post["text"][:400].replace("\n", " ").strip()
+    if len(post["text"]) > 400:
         summary_raw += "..."
-    summary = _slack_escape(summary_raw)
+    summary = _html_escape(summary_raw)
 
-    persona = _slack_escape(_build_persona_assessment(post["text"], post.get("subreddit")))
-    username = _slack_escape(post["username"])
+    persona = _html_escape(_build_persona_assessment(post["text"], post.get("subreddit")))
+    username = _html_escape(post["username"])
+    source_escaped = _html_escape(source_label)
+    categories_escaped = _html_escape(category_labels)
 
     why_match = (
-        f"Directly expresses pain around {_slack_escape(category_labels.lower())}, "
+        f"Directly expresses pain around {_html_escape(category_labels.lower())}, "
         "mapping to Larridin's capabilities in AI visibility, governance, and ROI measurement."
     )
 
-    return [
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": "🚨 Larridin Signal Detected"},
-        },
-        {
-            "type": "section",
-            "fields": [
-                {"type": "mrkdwn", "text": f"*Source*\n{_slack_escape(source_label)}"},
-                {"type": "mrkdwn", "text": f"*Posted*\n{age_str}"},
-                {"type": "mrkdwn", "text": f"*Score*\n{score} / 10"},
-                {"type": "mrkdwn", "text": f"*Subscores*\nPain {pain_score:.1f} | Persona {persona_score:.1f} | Recency {recency_score:.1f}"},
-            ],
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*Pain Point Category*\n{_slack_escape(category_labels)}",
-            },
-        },
-        {"type": "divider"},
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Post Summary*\n{summary}"},
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Why It Matches Larridin*\n{why_match}"},
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Persona Assessment*\n{persona}"},
-        },
-        {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"*Username:* {username}  |  "
-                        "*Enrichment:* Search LinkedIn & Google for company, name, or role"
-                    ),
-                }
-            ],
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "View Post"},
-                    "url": post["url"],
-                    "style": "primary",
-                }
-            ],
-        },
-    ]
-
-
-def send_slack_alert(
-    post: dict,
-    categories: list[str],
-    score: float,
-    pain_score: float,
-    persona_score: float,
-    recency_score: float,
-) -> None:
-    if DRY_RUN:
-        log.info(f"[DRY RUN] Would send Slack DM for {post['id']} (score={score})")
-        return
-
-    bot_token = os.getenv("SLACK_BOT_TOKEN", "")
-    user_id = os.getenv("SLACK_USER_ID", "")
-    if not bot_token or not user_id:
-        log.warning("SLACK_BOT_TOKEN or SLACK_USER_ID not set — Slack alert skipped")
-        return
-
-    blocks = _build_slack_blocks(
-        post, categories, score, pain_score, persona_score, recency_score
-    )
-    # Plaintext fallback shown in notifications and non-Block Kit clients
-    fallback = (
-        f"Larridin signal: {post['id']} | score={score} | "
-        f"categories={','.join(categories)} | {post['url']}"
+    # Telegram HTML mode — keep under 4096 chars
+    message = (
+        f"🚨 <b>Larridin Signal Detected</b>\n\n"
+        f"<b>Source:</b> {source_escaped}\n"
+        f"<b>Posted:</b> {age_str}\n"
+        f"<b>Score:</b> {score} / 10  "
+        f"<i>(Pain: {pain_score:.1f} | Persona: {persona_score:.1f} | Recency: {recency_score:.1f})</i>\n\n"
+        f"<b>Pain Point:</b> {categories_escaped}\n\n"
+        f"<b>Summary:</b>\n{summary}\n\n"
+        f"<b>Why It Matches Larridin:</b>\n{why_match}\n\n"
+        f"<b>Persona:</b>\n{persona}\n\n"
+        f"<b>Username:</b> {username}\n"
+        f"<b>Enrichment:</b> Search LinkedIn &amp; Google for company, name, or role\n\n"
+        f'<a href="{post["url"]}">View Post →</a>'
     )
 
     try:
         resp = requests.post(
-            "https://slack.com/api/chat.postMessage",
-            headers={"Authorization": f"Bearer {bot_token}"},
-            json={"channel": user_id, "text": fallback, "blocks": blocks},
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
             timeout=10,
         )
         resp.raise_for_status()
         payload = resp.json()
         if not payload.get("ok"):
-            log.error(f"Slack API error for {post['id']}: {payload.get('error')}")
+            log.error(f"Telegram error for {post['id']}: {payload.get('description')}")
         else:
-            log.info(f"Slack DM sent: {post['id']}")
+            log.info(f"Telegram message sent: {post['id']}")
     except Exception as exc:
-        log.error(f"Slack DM failed for {post['id']}: {type(exc).__name__}")
+        log.error(f"Telegram send failed for {post['id']}: {type(exc).__name__}")
 
 
 # ---------------------------------------------------------------------------
@@ -915,7 +764,6 @@ def append_lead(
 # ---------------------------------------------------------------------------
 
 def process_posts(posts: list[dict], seen: set[str]) -> tuple[int, int, int]:
-    """Score and route posts. Returns (high_count, low_count, discarded_count)."""
     high_count = low_count = discarded = 0
 
     for post in posts:
@@ -937,7 +785,7 @@ def process_posts(posts: list[dict], seen: set[str]) -> tuple[int, int, int]:
         final = compute_final_score(pain, persona, recency)
 
         if final >= HIGH_THRESHOLD:
-            send_slack_alert(post, categories, final, pain, persona, recency)
+            send_telegram_alert(post, categories, final, pain, persona, recency)
             append_lead(post, categories, final, "high", pain, persona, recency)
             high_count += 1
         elif final >= LOW_THRESHOLD:
@@ -955,8 +803,6 @@ def process_posts(posts: list[dict], seen: set[str]) -> tuple[int, int, int]:
 # ---------------------------------------------------------------------------
 
 def run(source: str = "all") -> None:
-    global DRY_RUN  # already set by main() before run() is called
-
     log.info(
         f"=== Larridin Social Listening Agent — "
         f"source={source} dry_run={DRY_RUN} ==="
@@ -991,12 +837,12 @@ def main() -> None:
     global DRY_RUN
 
     parser = argparse.ArgumentParser(
-        description="Larridin social listening agent — monitors Reddit and HN for AI pain signals"
+        description="Larridin social listening agent"
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Score posts but skip Slack alerts and file writes",
+        help="Score posts but skip Telegram alerts and file writes",
     )
     parser.add_argument(
         "--source",
@@ -1008,7 +854,7 @@ def main() -> None:
 
     DRY_RUN = args.dry_run
     if DRY_RUN:
-        log.info("Dry-run mode enabled — no Slack messages or file writes will occur")
+        log.info("Dry-run mode — no Telegram messages or file writes will occur")
 
     run(source=args.source)
 
