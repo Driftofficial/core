@@ -1,2 +1,16 @@
 node_modules
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Agent runtime files — contain credentials and scraped data
+.env
+seen_posts.json
+leads_log.jsonl
+agent.log
